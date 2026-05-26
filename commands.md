@@ -33,6 +33,36 @@ API enabled.
 .\.venv\Scripts\python.exe run_pairs_agent.py
 ```
 
+### Protect profits on existing positions (no new trades)
+
+The trailing-stop agent watches every open position in the account and
+ratchets the stop into profit as price moves favorably. It NEVER opens
+new positions — it only closes. Run it alongside any trading agent.
+
+```powershell
+# Default — 0.7% initial stop, 0.5% breakeven trigger, 0.5% trail
+.\.venv\Scripts\python.exe run_trailing_stop_agent.py
+
+# Tighter trail (locks profit faster, exits sooner)
+.\.venv\Scripts\python.exe run_trailing_stop_agent.py `
+    --initial-stop-pct 0.005 --breakeven-trigger-pct 0.003 --trail-pct 0.003
+
+# Only manage positions opened DURING this agent's lifetime
+# (skip pre-existing positions at startup)
+.\.venv\Scripts\python.exe run_trailing_stop_agent.py --manage-only-new
+
+# Run for the trading session then leave positions as-is
+.\.venv\Scripts\python.exe run_trailing_stop_agent.py --duration 23400
+```
+
+The three trail phases:
+
+| Phase     | When                                          | Stop is                              |
+| --------- | --------------------------------------------- | ------------------------------------ |
+| INITIAL   | Position just opened                          | Entry ± `initial_stop_pct` (loss)    |
+| BREAKEVEN | Favorable move ≥ `breakeven_trigger_pct`      | Forced to entry (no-loss locked)     |
+| TRAILING  | Stop has ratcheted above entry (longs)        | Peak × (1 − `trail_pct`) (profit)    |
+
 ### Trade with news only (no regime / multi)
 
 ```powershell
@@ -78,6 +108,43 @@ with the trading agent.
 The news observer subscribes, classifies headlines, and records to JSONL — but
 the `--observe` flag means it can't place an order even if the lexicon fires.
 Safe to leave running for hours.
+
+---
+
+## Three terminals — trade + trail + observe (recommended live setup)
+
+**Terminal 1 — opens positions:**
+
+```powershell
+.\.venv\Scripts\python.exe run_multi_agent.py --watchlist watchlist-1.json --category Semiconductors
+```
+
+**Terminal 2 — protects profit on every position:**
+
+```powershell
+.\.venv\Scripts\python.exe run_trailing_stop_agent.py
+```
+
+**Terminal 3 — watches the news stream without trading:**
+
+```powershell
+.\.venv\Scripts\python.exe run_news_agent.py --observe --client-id 99
+```
+
+How they cooperate via IBKR position events:
+
+1. Terminal 1 opens a LONG TSLA based on a pullback-to-EMA signal.
+2. Terminal 2 sees the new position (positionEvent), starts tracking with
+   an initial 0.7% stop, ratchets it as price moves up.
+3. Price runs up 1.5%, pulls back 0.5% — Terminal 2's trail triggers, fires
+   a market close. Profit is locked.
+4. Terminal 1's regime agent detects the external close (positionEvent),
+   clears its internal state, and on the next 5-min bar can re-enter if
+   the regime + bias still align.
+
+Terminal 3 is purely observational — it never sends orders. Use the JSONL
+to identify which headlines coincided with which trades for post-session
+review.
 
 ---
 
@@ -227,14 +294,15 @@ jq -s 'map(select(.kind=="close") | .pnl) | add' logs\multi-*.jsonl
 Default client IDs by runner — change with `--client-id <0-32>` if you see
 `Error 326: Client ID already in use`:
 
-| Runner                  | Default |
-| ----------------------- | ------- |
-| `run_regime_agent.py`   | 31      |
-| `run_multi_agent.py`    | 4       |
-| `run_news_agent.py`     | 22      |
-| `run_pairs_agent.py`    | 21      |
-| `flatten_positions.py`  | 15      |
-| `smoke_test.py`         | 11      |
+| Runner                       | Default |
+| ---------------------------- | ------- |
+| `run_regime_agent.py`        | 31      |
+| `run_multi_agent.py`         | 4       |
+| `run_news_agent.py`          | 22      |
+| `run_pairs_agent.py`         | 21      |
+| `run_trailing_stop_agent.py` | 8       |
+| `flatten_positions.py`       | 15      |
+| `smoke_test.py`              | 11      |
 
 Any value in `0–32` that's free works. If a previous run hasn't released the
 ID yet, just pick a different one; the previous connection will time out on

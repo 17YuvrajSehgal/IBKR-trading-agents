@@ -154,6 +154,40 @@ class RegimeAdaptiveAgent:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _on_position_event(self, ib_position) -> None:
+        """
+        IBKR position-change handler.
+
+        Fires when ANY position in the account changes — including closes
+        initiated by other agents (e.g. the trailing-stop agent). If we
+        were tracking this symbol and the broker now shows flat, clear
+        our internal position state so we can re-enter on the next signal.
+        """
+        if ib_position.contract.symbol != self.cfg.symbol:
+            return
+        # `position` is the signed share count; 0 means flat
+        if ib_position.position == 0 and self.position is not None:
+            logger.warning(
+                f"[{self.cfg.symbol}] external close detected "
+                f"(was holding {self.position.side.value} {self.position.shares}) "
+                f"— clearing internal state"
+            )
+            self.recorder.event(
+                "external_close_detected",
+                symbol=self.cfg.symbol,
+                was_side=self.position.side,
+                was_shares=self.position.shares,
+                was_entry=self.position.entry_price,
+            )
+            # Release the reservation so risk numbers stay sane
+            entry_action = "BUY" if self.position.side == Action.ENTER_LONG else "SELL"
+            self.risk.release_reservation(
+                self.cfg.symbol, entry_action,
+                self.position.shares, self.position.entry_price,
+            )
+            self.position = None
+            self._last_close_at = asyncio.get_event_loop().time()
+
     async def start(self) -> None:
         logger.info(
             f"Starting regime-adaptive agent on {self.cfg.symbol} "
@@ -217,6 +251,11 @@ class RegimeAdaptiveAgent:
 
         # Latest bias from warmup
         self._latest_bias = self.bias_detector.bias
+
+        # Listen for external closes (e.g. trailing-stop agent closing our position)
+        # so we can clean up internal state and re-enter on the next signal.
+        self.ib.positionEvent += self._on_position_event
+
         logger.info(f"[{self.cfg.symbol}] Agent live — waiting for bar updates")
 
         # Record warmup state for offline analysis

@@ -18,6 +18,8 @@ These have been smoke-tested on the live paper TWS and confirmed end-to-end:
 - **Multi-symbol regime runner (`run_multi_agent.py`)** — 248-symbol watchlist warmed up in ~11 min; 11 simultaneous entries on a 5-min bar; risk-manager race fix verified blocks subsequent entries.
 - **Flatten utility (`flatten_positions.py`)** — cancels working orders first, then closes all positions with fill waiting.
 - **News-driven agent (`run_news_agent.py`)** — subscription + headline classification pipeline confirmed; observe mode confirmed.
+- **Trailing-stop agent (`run_trailing_stop_agent.py`)** — picked up 9 pre-existing positions, immediately shifted SPOT and LMND into BREAKEVEN/TRAILING phase with stops above entry. Ratchet logic unit-tested across LONG profit, LONG loss, and SHORT profit scenarios.
+- **External-close detection in regime agent** — `positionEvent` handler clears internal state when another agent (trailing-stop, manual TWS, flatten utility) closes a tracked position, so the regime agent can re-enter on the next signal.
 
 ---
 
