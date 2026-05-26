@@ -282,7 +282,7 @@ Strategies register for reconnects via `conn.on_reconnect(callback)` — the age
 
 ## Strategies
 
-Two reference agents are included. Both are paper-only by default — the runners refuse the live-trading port — and both force-flatten any open position on Ctrl-C.
+Reference agents are included. All are paper-only by default — the runners refuse the live-trading port — and all force-flatten any open position on Ctrl-C.
 
 ### 1. TQQQ / SQQQ mean-reversion pairs agent
 
@@ -430,7 +430,67 @@ Multi-agent session summary
 
 Files: `run_multi_agent.py` (reuses the same `RegimeAdaptiveAgent` internally).
 
-### Honest expectations for both agents
+### 4. News-driven agent
+
+A reactive agent that subscribes to live IBKR news for a focused symbol list and trades on **actionable** headlines — strong sentiment from a credible provider.
+
+```
+NewsManager (per-symbol headline stream via genericTick 292)
+   ↓
+NewsClassifier  (keyword lexicon; phrase scoring -5..+5)
+   ↓ if |score| ≥ threshold + provider weight ≥ ε + cooldown elapsed + flat
+RiskManager (atomic check + reserve)
+   ↓
+OrderManager → market order with % stop / target / time-stop
+```
+
+**Sentiment scoring** uses a hand-curated lexicon of ~150 phrases — earnings beats, guidance cuts, FDA approvals, lawsuits, etc. Compound phrases ("fails to beat", "raises full-year guidance") are matched longest-first so negation is encoded in the phrase. Provider weight is multiplied in (DJNL = 1.0, BRFG = 0.8, BZ = 0.6, unknown = 0.5).
+
+**Exits** — news effects decay fast, so the agent uses **percentage** stops + time-stop instead of ATR:
+- Stop = entry × (1 ± `--stop-pct`)  (default 0.7%)
+- Target = entry × (1 ± `--target-pct`) (default 1.4%, so 2:1 R:R)
+- Time stop = `--time-stop-min` minutes (default 30)
+- Cooldown per symbol = `--cooldown-min` (default 60) prevents follow-up headlines retriggering
+
+```powershell
+# Default — 10 high-liquidity names, $5k per trade, paper port
+.\.venv\Scripts\python.exe run_news_agent.py
+
+# Narrower focus + tighter risk
+.\.venv\Scripts\python.exe run_news_agent.py `
+    --symbols TSLA,NVDA,COIN --threshold 3.5 --dollars-per-trade 2000 `
+    --duration 7200
+
+# Long-only
+.\.venv\Scripts\python.exe run_news_agent.py --shorts off
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--symbols` | 10 large-cap names | Comma-separated universe |
+| `--threshold` | `2.5` | Min \|weighted score\| to fire |
+| `--shorts` | `confident` | `confident` requires strong negative + premium provider |
+| `--short-strong-threshold` | `3.5` | Used in `confident` mode |
+| `--dollars-per-trade` | `5000` | Gross $ exposure per trade |
+| `--stop-pct` | `0.007` | 0.7% stop loss |
+| `--target-pct` | `0.014` | 1.4% take-profit |
+| `--time-stop-min` | `30` | Time-based exit |
+| `--cooldown-min` | `60` | Per-symbol re-entry block |
+| `--max-daily-loss` | `5000` | RiskManager kill switch |
+| `--duration` | `0` | Auto-stop after N seconds |
+
+**Honest caveats specific to news trading:**
+
+- **IBKR's retail news is delayed** relative to Bloomberg/Reuters direct feeds. By the time a headline arrives on your terminal, the institutional move is often already over.
+- **Symbol tagging is imperfect** — some headlines arrive via topic streams (DJ-RTG, DJ-N) without a symbol tag, so they can't trigger per-symbol trades.
+- **Free providers (BRFG) are slow and noisy** vs paid (DJNL/DJ-RT). Premium subscriptions help materially.
+- **The lexicon is the bottleneck** — if your strategy isn't firing, it's probably because real headlines don't match the templates. Read your JSONL `headline` and `score` events to find new phrases worth adding.
+
+Files: `strategies/news_driven/{classifier,agent}.py`, `run_news_agent.py`.
+
+---
+
+### Honest expectations across all agents
 
 - **Neither will print money.** Both have negative skew: many small wins, occasional larger losses.
 - **Win rate ~45–55% is normal.** The edge, if any, is in the R:R management.
