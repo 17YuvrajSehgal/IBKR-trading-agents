@@ -105,6 +105,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--session-id", default=None)
+    p.add_argument(
+        "--observe", action="store_true",
+        help="Observe-only: classify and record every headline + 'would-have' "
+             "trade decisions to the JSONL, but DO NOT place any orders. "
+             "Use to tune the lexicon, run alongside another trading agent, "
+             "or just watch the news flow without risk.",
+    )
 
     return p.parse_args()
 
@@ -194,6 +201,7 @@ async def main(args: argparse.Namespace) -> int:
         target_pct=args.target_pct,
         time_stop_seconds=args.time_stop_min * 60.0,
         cooldown_seconds=args.cooldown_min * 60.0,
+        observe=args.observe,
     )
 
     stop_event = asyncio.Event()

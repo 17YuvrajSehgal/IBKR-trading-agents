@@ -89,6 +89,11 @@ class NewsAgentConfig:
     # How long to wait for a quote after a headline before giving up
     quote_wait_seconds: float = 5.0
 
+    # Observe-only mode: subscribe + classify + record everything, but DO NOT
+    # place any orders. Useful for tuning the lexicon, running alongside a
+    # different trading agent, or just watching the news flow.
+    observe: bool = False
+
 
 @dataclass
 class OpenPosition:
@@ -158,10 +163,22 @@ class NewsDrivenAgent:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        mode = "OBSERVE (no orders)" if self.cfg.observe else "LIVE"
         logger.info(
-            f"Starting news-driven agent on {self.cfg.symbols} "
+            f"Starting news-driven agent [{mode}] on {self.cfg.symbols} "
             f"(threshold={self.cfg.action_threshold}, "
             f"size=${self.cfg.dollars_per_trade:,.0f}, shorts={self.cfg.short_mode.value})"
+        )
+        if self.cfg.observe:
+            logger.info("*" * 70)
+            logger.info("* OBSERVE MODE — agent will classify and record but never trade. *")
+            logger.info("*" * 70)
+        self.recorder.event(
+            "agent_start",
+            mode=("observe" if self.cfg.observe else "live"),
+            symbols=self.cfg.symbols,
+            threshold=self.cfg.action_threshold,
+            short_mode=self.cfg.short_mode,
         )
 
         # Show available providers so the operator knows what feed they're using
@@ -303,6 +320,40 @@ class NewsDrivenAgent:
 
         shares = max(1, int(self.cfg.dollars_per_trade // entry))
 
+        if score.is_positive:
+            stop_price = entry * (1 - self.cfg.stop_pct)
+            target_price = entry * (1 + self.cfg.target_pct)
+        else:
+            stop_price = entry * (1 + self.cfg.stop_pct)
+            target_price = entry * (1 - self.cfg.target_pct)
+
+        # OBSERVE MODE: log + record what we would have done, but do NOT
+        # place an order, reserve risk, or open a position.
+        if self.cfg.observe:
+            self.stats.headlines_actionable += 0  # already counted in _maybe_act
+            logger.info(
+                f"  [OBSERVE] would-OPEN "
+                f"{('LONG' if score.is_positive else 'SHORT')} {shares} {symbol} "
+                f"@~${entry:.2f}  stop=${stop_price:.2f}  target=${target_price:.2f}  "
+                f"score={score.score:+.1f}"
+            )
+            self.recorder.event(
+                "would_open",
+                symbol=symbol,
+                side=("LONG" if score.is_positive else "SHORT"),
+                shares=shares,
+                entry=entry,
+                stop=stop_price,
+                target=target_price,
+                score=score.score,
+                provider=score.provider_code,
+                headline=score.headline,
+                matched=[m[0] for m in score.matched],
+            )
+            # Set cooldown so we don't spam the JSONL with the same headline burst.
+            self._last_action_at[symbol] = asyncio.get_event_loop().time()
+            return
+
         check = self.risk.check_order(symbol, side.value, shares, entry)
         self.stats.trades_attempted += 1
         if not check.approved:
@@ -312,13 +363,6 @@ class NewsDrivenAgent:
                 "risk_reject", symbol=symbol, side=side, shares=shares, reason=check.reason,
             )
             return
-
-        if score.is_positive:
-            stop_price = entry * (1 - self.cfg.stop_pct)
-            target_price = entry * (1 + self.cfg.target_pct)
-        else:
-            stop_price = entry * (1 + self.cfg.stop_pct)
-            target_price = entry * (1 - self.cfg.target_pct)
 
         logger.info(
             f"  OPEN {('LONG' if score.is_positive else 'SHORT')} {shares} {symbol} "
