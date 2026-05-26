@@ -20,6 +20,7 @@ These have been smoke-tested on the live paper TWS and confirmed end-to-end:
 - **News-driven agent (`run_news_agent.py`)** — subscription + headline classification pipeline confirmed; observe mode confirmed.
 - **Trailing-stop agent (`run_trailing_stop_agent.py`)** — picked up 9 pre-existing positions, immediately shifted SPOT and LMND into BREAKEVEN/TRAILING phase with stops above entry. Ratchet logic unit-tested across LONG profit, LONG loss, and SHORT profit scenarios.
 - **External-close detection in regime agent** — `positionEvent` handler clears internal state when another agent (trailing-stop, manual TWS, flatten utility) closes a tracked position, so the regime agent can re-enter on the next signal.
+- **Cross-client close coordination** — every close path (regime, news, trailing) now does two checks before submitting: (1) a local `closing` flag prevents intra-agent double-fires from queued evaluations; (2) `OrderManager.has_working_order()` uses `reqAllOpenOrdersAsync` to see if any OTHER client in the same account has a working order on the same symbol/side and skips if so. This prevents the regime agent and trailing-stop agent (running in separate processes) from both closing the same position and ending up with an opposite-side short/long over-shoot.
 
 ---
 

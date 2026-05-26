@@ -676,6 +676,51 @@ class OrderManager:
             logger.error(error_msg)
             raise IBKROrderError(error_msg) from e
     
+    async def has_working_order(
+        self,
+        symbol: str,
+        action: "str | OrderAction",
+    ) -> bool:
+        """
+        True if any client in the account has a non-terminal order for
+        ``symbol`` on the given ``action`` side.
+
+        Used to prevent two agents from both submitting close orders for
+        the same position (which would over-flip into the opposite side).
+        Calls ``reqAllOpenOrdersAsync`` so it sees orders from ALL clients
+        connected to the account, not just this client's local cache.
+
+        Fail-safe behavior: if the server call fails, returns False (assume
+        no conflict) so the caller isn't stuck. Pair with the per-position
+        ``closing`` flag and a post-close verification for full coverage.
+        """
+        action_str = action.value if isinstance(action, OrderAction) else str(action).upper()
+        try:
+            all_trades = await self.ib.reqAllOpenOrdersAsync()
+        except Exception as e:
+            logger.warning(f"has_working_order: reqAllOpenOrdersAsync failed: {e}")
+            return False
+
+        sym_upper = symbol.upper()
+        for trade in all_trades or []:
+            try:
+                if trade.contract is None or trade.order is None:
+                    continue
+                if trade.contract.symbol.upper() != sym_upper:
+                    continue
+                if str(trade.order.action).upper() != action_str:
+                    continue
+                if trade.isDone():
+                    continue
+            except AttributeError:
+                continue
+            logger.info(
+                f"has_working_order: existing {action_str} for {symbol} "
+                f"orderId={trade.order.orderId} status={trade.orderStatus.status}"
+            )
+            return True
+        return False
+
     async def wait_for_done(
         self,
         order_id: int,

@@ -78,6 +78,11 @@ class OpenPosition:
     target_price: float
     entry_regime: Regime
     bars_held: int = 0
+    # True once we've initiated a close (locally or detected externally).
+    # Prevents the same agent from firing duplicate close orders if the
+    # exit condition keeps evaluating true while the close order is in
+    # flight to TWS.
+    closing: bool = False
 
 
 @dataclass
@@ -475,11 +480,41 @@ class RegimeAdaptiveAgent:
     async def _close_position(self, reason: str) -> None:
         if self.position is None:
             return
+        if self.position.closing:
+            # We've already submitted a close; skip duplicates from rapid
+            # consecutive bar evaluations.
+            logger.debug(f"[{self.cfg.symbol}] close already in progress, skipping")
+            return
 
         pos = self.position
         # Reverse the side
         action = OrderAction.SELL if pos.side == Action.ENTER_LONG else OrderAction.BUY
         last_price = self._last_mtf_close.close if self._last_mtf_close else pos.entry_price
+
+        # Cross-client coordination: don't fire a close if another agent (e.g.
+        # the trailing-stop) has already submitted one. Catches inter-process
+        # races that the local 'closing' flag can't see.
+        if await self.orders.has_working_order(self.cfg.symbol, action):
+            logger.warning(
+                f"[{self.cfg.symbol}] another client has a working {action.value} "
+                f"order — skipping our close to avoid double-fire"
+            )
+            self.recorder.event(
+                "close_skipped_race",
+                symbol=self.cfg.symbol,
+                side=pos.side,
+                shares=pos.shares,
+                reason=reason,
+            )
+            # Mark closing so subsequent evaluations don't keep trying;
+            # the positionEvent handler will clear self.position when the
+            # other agent's close fills.
+            self.position.closing = True
+            return
+
+        # Reserve our slot: mark closing BEFORE any await to prevent
+        # re-entry by a queued evaluation.
+        pos.closing = True
 
         logger.info(
             f"CLOSE {pos.side.value} {pos.shares} {self.cfg.symbol} @~${last_price:.2f}  "
@@ -501,6 +536,8 @@ class RegimeAdaptiveAgent:
                 shares=pos.shares,
                 error=str(e),
             )
+            # Release the closing reservation so a future tick can retry
+            pos.closing = False
             return
 
         done = await self.orders.wait_for_done(close_info.order_id, timeout=10.0)

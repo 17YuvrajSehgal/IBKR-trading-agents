@@ -146,6 +146,27 @@ Terminal 3 is purely observational — it never sends orders. Use the JSONL
 to identify which headlines coincided with which trades for post-session
 review.
 
+### How the multi-agent setup avoids double-closes
+
+Each agent's `_close_position` (regime, trailing-stop, news) follows the same
+sequence before placing a close order:
+
+1. **Local `closing` flag** — if we've already submitted a close for this
+   position, skip. Prevents the same agent from firing duplicates as fast
+   bar evaluations or tick handlers re-enter the close path.
+2. **`OrderManager.has_working_order(symbol, action)`** — uses
+   `reqAllOpenOrdersAsync` to query TWS for orders from ALL clients in the
+   account. If another client already has a working close on this symbol,
+   we skip and record a `close_skipped_race` event.
+3. **Set the local `closing` flag**, place the market close, await the
+   terminal state.
+4. The IBKR `positionEvent` fires when the broker confirms flat — at that
+   point every agent watching the symbol clears its internal state, and
+   the regime agent's external-close detector applies the cooldown.
+
+Net effect: even with regime, trailing, and news agents running in three
+separate processes, only one close per position actually goes through to TWS.
+
 ---
 
 ## Time-bounded runs

@@ -409,6 +409,29 @@ class TrailingStopAgent:
     async def _close(self, tp: TrackedPosition, trigger_price: float, reason: str) -> None:
         action = OrderAction.SELL if tp.side == Side.LONG else OrderAction.BUY
 
+        # Cross-client coordination: skip if another agent (e.g. the regime
+        # agent on its own bar-close exit logic, or a manual flatten) has
+        # already submitted a close. tp.closing was set by the quote handler
+        # before scheduling us, so duplicate ticks within this agent are
+        # already filtered.
+        if await self.orders.has_working_order(tp.symbol, action):
+            logger.warning(
+                f"[TRAIL] {tp.symbol}: another client has a working {action.value} "
+                f"order — releasing our close so the other side handles it"
+            )
+            self.recorder.event(
+                "close_skipped_race",
+                symbol=tp.symbol,
+                side=tp.side,
+                shares=tp.shares,
+                phase=tp.phase,
+            )
+            # Release the closing flag — if the other client's close fills,
+            # positionEvent will remove us from `tracked`. If it doesn't,
+            # the next tick will re-trigger us.
+            tp.closing = False
+            return
+
         # Categorize the exit BEFORE placing the order, based on the
         # phase the trail was in when we triggered.
         if tp.phase == TrailPhase.TRAILING:

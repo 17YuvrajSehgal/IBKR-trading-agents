@@ -106,6 +106,9 @@ class OpenPosition:
     target_price: float
     triggering_headline: str
     triggering_score: float
+    # Set once we've initiated a close — prevents the exit monitor from
+    # re-firing while the close order is in flight.
+    closing: bool = False
 
 
 @dataclass
@@ -462,12 +465,29 @@ class NewsDrivenAgent:
         position = self.positions.get(symbol)
         if position is None:
             return
+        if position.closing:
+            return  # already submitting
 
         action = OrderAction.SELL if position.side == PositionSide.LONG else OrderAction.BUY
         last_quote = self.market_data.get_quote(symbol)
         last_price = exit_price if exit_price is not None else (
             last_quote.mid if last_quote and last_quote.mid > 0 else position.entry_price
         )
+
+        # Cross-client guard
+        if await self.orders.has_working_order(symbol, action):
+            logger.warning(
+                f"  {symbol}: another client has a working {action.value} "
+                f"order — skipping news-agent close"
+            )
+            self.recorder.event(
+                "close_skipped_race", symbol=symbol, side=position.side,
+                shares=position.shares, reason=reason,
+            )
+            position.closing = True   # don't keep retrying every quote tick
+            return
+
+        position.closing = True
 
         logger.info(
             f"  CLOSE {position.side.value} {position.shares} {symbol} @~${last_price:.2f}  "
@@ -481,6 +501,7 @@ class NewsDrivenAgent:
             self.recorder.event(
                 "close_order_failed", symbol=symbol, shares=position.shares, error=str(e),
             )
+            position.closing = False   # allow retry on next tick
             # Don't release reservation — position state is now uncertain.
             return
 
