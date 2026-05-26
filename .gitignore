@@ -1,2 +1,22 @@
 .idea
 .claude
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime artifacts (session logs, JSONL event streams)
+logs/
+ibkr_logs/
+ibkr.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

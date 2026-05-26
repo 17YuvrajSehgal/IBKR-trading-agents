@@ -676,6 +676,46 @@ class OrderManager:
             logger.error(error_msg)
             raise IBKROrderError(error_msg) from e
     
+    async def wait_for_done(
+        self,
+        order_id: int,
+        timeout: float = 10.0,
+        poll_interval: float = 0.1,
+    ) -> bool:
+        """
+        Wait until an order reaches a terminal state (Filled or Cancelled).
+
+        Use this before disconnecting from TWS to ensure close orders actually
+        execute — ``placeOrder`` is sync but execution is async, so an
+        immediately-following disconnect can leave the order in flight.
+
+        Args:
+            order_id:      Order ID returned by a place_*_order call.
+            timeout:       Maximum seconds to wait.
+            poll_interval: How often to check (seconds).
+
+        Returns:
+            True if the order reached a terminal state within the timeout,
+            False if it timed out or the order is unknown.
+        """
+        trade = self.trades.get(order_id)
+        if trade is None:
+            logger.warning(f"wait_for_done: order {order_id} not tracked")
+            return False
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while not trade.isDone():
+            if loop.time() >= deadline:
+                logger.warning(
+                    f"Order {order_id} did not finish within {timeout}s "
+                    f"(status={trade.orderStatus.status})"
+                )
+                return False
+            await asyncio.sleep(poll_interval)
+
+        return True
+
     async def get_order_status(self, order_id: int) -> OrderStatus:
         """
         Get current status of an order.

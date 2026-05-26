@@ -15,6 +15,7 @@ from typing import Any, Optional
 from ib_async import IB, util
 
 from ibkr.config import IBKRConfig, TradingMode
+from ibkr.error_codes import Category, Severity, classify
 from ibkr.exceptions import (
     IBKRConnectionError,
     IBKRTimeoutError,
@@ -64,10 +65,10 @@ class IBKRConnection:
     def __init__(self, config: IBKRConfig) -> None:
         """
         Initialize IBKR connection manager.
-        
+
         Args:
             config: IBKR configuration
-        
+
         Raises:
             ValueError: If configuration is invalid
         """
@@ -76,10 +77,15 @@ class IBKRConnection:
         self.is_connected = False
         self.connection_time: Optional[datetime] = None
         self.reconnect_count = 0
-        
+
+        # Callbacks fired AFTER auto-reconnect succeeds. Callers (e.g. strategy
+        # agents) register here to re-subscribe market/historical data that
+        # was dropped by the server reset.
+        self._on_reconnect_callbacks: list = []
+
         # Configure logging
         self._setup_logging()
-        
+
         # Setup event handlers
         self._setup_event_handlers()
         
@@ -142,30 +148,70 @@ class IBKRConnection:
     
     def _on_error(self, reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
         """
-        Handle error events from TWS/Gateway.
-        
-        Args:
-            reqId: Request ID that caused the error
-            errorCode: IBKR error code
-            errorString: Error message
-            contract: Contract associated with error (if any)
+        Handle error/info events from TWS/Gateway.
+
+        Routes each message through `ibkr.error_codes.classify` so:
+          * Data-farm heartbeats (2104/2106/2158/...) log at DEBUG — not WARNING.
+          * Connection lifecycle (1100/1101/1102) logs at WARNING and triggers
+            on_reconnect callbacks when connectivity is restored with data
+            loss (1101) — callers must re-subscribe.
+          * Real errors and fatals log loudly.
+          * Unknown codes log at WARNING so they're visible without crashing.
         """
-        # Categorize error severity
-        if errorCode in [502, 504, 1100, 1101, 1102]:
-            # Connection-related errors
-            logger.error(
-                f"Connection error [{errorCode}]: {errorString} (reqId={reqId})"
-            )
-        elif errorCode >= 2000:
-            # Warnings
-            logger.warning(
-                f"Warning [{errorCode}]: {errorString} (reqId={reqId})"
-            )
-        else:
-            # Other errors
-            logger.error(
-                f"Error [{errorCode}]: {errorString} (reqId={reqId})"
-            )
+        info = classify(errorCode)
+
+        level_map = {
+            Severity.INFO: logging.INFO,
+            Severity.WARNING: logging.WARNING,
+            Severity.ERROR: logging.ERROR,
+            Severity.FATAL: logging.CRITICAL,
+        }
+        level = level_map[info.severity]
+
+        # Data farm pings come in a constant stream during the daily reset.
+        # Demote those to DEBUG so the operator log isn't drowned by them.
+        if info.category is Category.DATA_FARM and info.auto_recovers:
+            level = logging.DEBUG
+
+        logger.log(
+            level,
+            f"[{info.severity.value}][{info.category.value}] "
+            f"{errorCode}: {errorString} (reqId={reqId})"
+        )
+
+        # Connectivity restored WITH data loss → ask subscribers to resubscribe
+        if errorCode == 1101:
+            self._fire_on_reconnect("connection-restored-data-lost")
+        elif errorCode == 1102:
+            # Restored without data loss — nothing to do, but record it
+            logger.info("Connectivity restored without data loss")
+
+    # ------------------------------------------------------------------
+    # Reconnect-callback API (for strategy agents)
+    # ------------------------------------------------------------------
+
+    def on_reconnect(self, callback) -> None:
+        """
+        Register a callback to be invoked after auto-reconnect succeeds, so
+        the strategy can re-subscribe market or historical data that was
+        dropped during the disconnection.
+
+        Callback signature:  callback(reason: str) -> None | Awaitable[None]
+
+        Sync callbacks run inline; async callbacks are scheduled on the loop.
+        """
+        if callback not in self._on_reconnect_callbacks:
+            self._on_reconnect_callbacks.append(callback)
+
+    def _fire_on_reconnect(self, reason: str) -> None:
+        """Invoke all registered on_reconnect callbacks, never raising."""
+        for cb in list(self._on_reconnect_callbacks):
+            try:
+                result = cb(reason)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:
+                logger.error(f"on_reconnect callback {cb!r} raised: {e}")
     
     def _on_timeout(self, idlePeriod: float) -> None:
         """
@@ -310,8 +356,10 @@ class IBKRConnection:
         try:
             await self.connect()
             self.reconnect_count = 0  # Reset on successful reconnection
-            logger.info("Reconnection successful")
-        
+            logger.info("Reconnection successful — notifying subscribers")
+            # Tell strategy callers to re-subscribe their data streams
+            self._fire_on_reconnect("auto-reconnect")
+
         except Exception as e:
             logger.error(f"Reconnection attempt {self.reconnect_count} failed: {e}")
             # Will retry on next disconnect event if attempts remain

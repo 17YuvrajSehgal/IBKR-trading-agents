@@ -38,6 +38,12 @@ Example:
 
 # ── Always-safe imports (no ib_async dependency) ──────────────────────────
 from ibkr.config import IBKRConfig, TradingMode
+from ibkr.error_codes import (
+    Category as IBKRMessageCategory,
+    MessageInfo,
+    Severity as IBKRMessageSeverity,
+    classify as classify_ibkr_message,
+)
 from ibkr.exceptions import (
     IBKRException,
     IBKRConnectionError,
@@ -48,8 +54,9 @@ from ibkr.exceptions import (
     IBKRInsufficientFundsError,
     IBKRInvalidOrderError,
 )
+from ibkr.recorder import NULL_RECORDER, SessionRecorder
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Configuration (no ib_async dependency)
@@ -64,6 +71,14 @@ __all__ = [
     "IBKRDataError",
     "IBKRInsufficientFundsError",
     "IBKRInvalidOrderError",
+    # Error classification (no ib_async dependency)
+    "IBKRMessageSeverity",
+    "IBKRMessageCategory",
+    "MessageInfo",
+    "classify_ibkr_message",
+    # Session recording (no ib_async dependency)
+    "SessionRecorder",
+    "NULL_RECORDER",
     # Broker modules — import directly when needed:
     #   from ibkr.connection import IBKRConnection
     #   from ibkr.trading import OrderManager, OrderInfo, OrderAction, OrderType, OrderStatus

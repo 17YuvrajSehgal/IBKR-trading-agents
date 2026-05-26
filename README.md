@@ -229,8 +229,216 @@ async with IBKRConnection(config) as conn:
 
 ---
 
+## Session logging & error handling
+
+Every runner writes two paired files per session into `logs/`:
+
+```
+logs/{runner}-YYYY-MM-DDTHH-MM-SS.log     # text log (human-readable)
+logs/{runner}-YYYY-MM-DDTHH-MM-SS.jsonl   # structured events (machine-readable)
+```
+
+The JSONL stream is one JSON object per line, with a UTC millisecond timestamp and a `kind` discriminator. Events include `runner_start`, `warmup_complete` (per symbol), `bias_change`, `open`, `close`, `order_failed`, `session_summary`, and `session_end`. Trivial to grep/aggregate:
+
+```powershell
+# Show all closes with their PnL
+Get-Content logs\multi-*.jsonl | %{ $_ | ConvertFrom-Json } | ?{ $_.kind -eq 'close' } | Select symbol,pnl,reason
+
+# Or with jq if you have it
+jq -c 'select(.kind=="close")' logs/multi-*.jsonl
+```
+
+Share these files when reporting an issue or asking for review — they capture every decision and outcome.
+
+### Emergency flatten
+
+If a previous run left positions open (or you just want a clean slate before a new run), use the flatten utility:
+
+```powershell
+# Preview what would be closed (no orders sent)
+.\.venv\Scripts\python.exe flatten_positions.py --dry-run
+
+# Close everything
+.\.venv\Scripts\python.exe flatten_positions.py
+
+# Close one symbol only
+.\.venv\Scripts\python.exe flatten_positions.py --symbol TSLA
+```
+
+It cancels any working orders first (so previous-run leftovers don't fight you), then sends market closes and waits for fills. Refuses the live-trading port unless `--force-live`.
+
+### IBKR message classification
+
+The `ibkr.error_codes` module maps every IBKR message code to a `Severity` (INFO / WARNING / ERROR / FATAL) and `Category` (CONNECTION / DATA_FARM / ORDER / DATA / PACING / SYSTEM / UNKNOWN). The connection handler uses this to route messages correctly:
+
+- Data-farm heartbeats (2104/2106/2108/2158/…) → DEBUG (silenced by default)
+- Daily-reset connection lifecycle (1100/1101/1102) → WARNING + triggers `on_reconnect` callbacks for strategies to re-subscribe
+- Real errors (200/201/202) → ERROR
+- Fatals (326/502/504) → CRITICAL
+
+Strategies register for reconnects via `conn.on_reconnect(callback)` — the agent calls them after a successful auto-reconnect so it can re-subscribe historical data subscriptions that the server reset dropped.
+
 ---
 
+## Strategies
+
+Two reference agents are included. Both are paper-only by default — the runners refuse the live-trading port — and both force-flatten any open position on Ctrl-C.
+
+### 1. TQQQ / SQQQ mean-reversion pairs agent
+
+A statistical pairs trade on the joint mispricing `s = ln(TQQQ) + ln(SQQQ)`, which is approximately stationary on short windows because TQQQ targets +3×QQQ and SQQQ targets −3×QQQ daily.
+
+**This is not arbitrage.** It's a mean-reversion bet that has positive expected value in choppy markets and loses money in trends.
+
+```powershell
+.\.venv\Scripts\python.exe run_pairs_agent.py
+.\.venv\Scripts\python.exe run_pairs_agent.py --dollars-per-leg 2000 --z-enter 2.5 --duration 600
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--dollars-per-leg` | `5000` | $ exposure per leg (total notional ≈ 2×) |
+| `--z-enter` | `2.0` | Open when \|z\| exceeds this |
+| `--z-exit` | `0.5` | Close when \|z\| returns under this |
+| `--z-stop` | `4.0` | Stop out on adverse move past this |
+| `--lookback` | `300` | Rolling window samples |
+| `--max-daily-loss` | `500` | RiskManager kill-switch |
+| `--duration` | `0` | Auto-stop after N seconds |
+
+Files: `strategies/pairs_signal.py` (pure signal), `strategies/tqqq_sqqq_agent.py` (executor), `run_pairs_agent.py`.
+
+### 2. Regime-adaptive multi-timeframe technical agent (TSLA)
+
+A multi-strategy agent that **switches its trading style based on detected market regime** instead of betting one style will fit every condition.
+
+```
+1-hour bars ──► BiasDetector ──► Bias (BULL / BEAR / NEUTRAL)
+                                              │
+5-min bars ───► RegimeDetector ──► Regime ◄───┘
+                                       │
+                                       ▼
+                              SignalGenerator
+                                       │
+                                       ▼
+                    OrderManager (sized by ATR, gated by RiskManager)
+```
+
+**Regimes** (detected on the entry timeframe via ADX + ATR/price):
+- `TREND_UP` / `TREND_DOWN` — ADX ≥ 25, follow EMA direction
+- `RANGE` — ADX < 20, mean-revert
+- `HIGH_VOL` — ATR/price > 1.5%, stand aside
+- `AMBIGUOUS` — ADX in [20, 25], no conviction, stand aside
+
+**Entries**: trend → pullback to EMA20 + RSI confirmation;  range → Bollinger band touch + RSI extreme.
+
+**Exits**: 1.5×ATR stop, 2.5×ATR target, time-stop after 24 bars, immediate exit on regime flip against the position.
+
+**Sizing**: volatility-targeted. `shares = risk_$_per_trade / (1.5 × ATR)` — so a TSLA $400 move risks the same dollars as a TSLA $40 move.
+
+```powershell
+# Default: TSLA, HTF=1h, MTF=5m, 0.3% risk per trade
+.\.venv\Scripts\python.exe run_regime_agent.py
+
+# Different symbol / timeframe
+.\.venv\Scripts\python.exe run_regime_agent.py --symbol NVDA --mtf "15 mins" --duration 1800
+
+# More conservative
+.\.venv\Scripts\python.exe run_regime_agent.py `
+    --risk-pct 0.002 --max-risk-usd 100 --max-daily-loss 300 `
+    --stop-atr 2.0 --target-atr 3.0
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--symbol` | `TSLA` | Any tradeable US stock |
+| `--htf` | `1 hour` | Bias timeframe |
+| `--mtf` | `5 mins` | Entry timeframe |
+| `--risk-pct` | `0.003` | Fraction of NetLiq risked per trade |
+| `--max-risk-usd` | `200` | Absolute cap on per-trade $ risk |
+| `--max-notional` | `30000` | Max $ exposure per position |
+| `--stop-atr` | `1.5` | Stop = entry ± stop-atr × ATR |
+| `--target-atr` | `2.5` | Target = entry ± target-atr × ATR |
+| `--max-bars-held` | `24` | Time-stop in bars |
+| `--max-daily-loss` | `500` | RiskManager kill switch |
+| `--shorts` | `confident` | Short policy: `confident` / `symmetric` / `off` (see below) |
+| `--duration` | `0` | Auto-stop after N seconds |
+
+**Short policy** — equities have a structural long bias, so the agent treats shorts more conservatively than longs by default:
+
+| Mode | Long requires | Short requires |
+|---|---|---|
+| `confident` (default) | HTF ≠ BEAR | **HTF == BEAR** (strict) |
+| `symmetric` | HTF ≠ BEAR | HTF ≠ BULL (mirror of longs) |
+| `off` | HTF ≠ BEAR | (never) |
+
+Under the default `confident`, a short fires only when **all three** align: HTF bias is explicitly BEAR, MTF regime is TREND_DOWN (trend short) or RANGE (BB-upper mean-reversion short), and the entry trigger hits. Use `--shorts symmetric` if you want the agent to short on neutral HTF bias as well; use `--shorts off` for long-only.
+
+**Caveats on real shorts** (paper doesn't capture these):
+- IBKR refuses HTB (hard-to-borrow) names — paper happily shorts anything.
+- Borrow fees are charged daily on real shorts (range: ~0.25%/yr for ETB to 30%+ for HTB).
+- Earnings / news can gap shorts brutally — overnight shorts have no theoretical loss cap going up.
+
+Files: `strategies/regime_adaptive/{indicators,bars,regime,signals,agent}.py`, `run_regime_agent.py`.
+
+### 3. Multi-symbol regime-adaptive runner
+
+Runs the regime-adaptive agent on multiple symbols **in parallel**, on a single IB connection. All agents share:
+
+- one connection (single `client_id`)
+- one `OrderManager` (no duplicate event handlers)
+- one **shared `RiskManager`** so the daily-loss kill switch and total-notional cap are **global** across symbols, not per-name
+
+Each agent maintains its own bar subscriptions, indicators, regime state, position, and stats — decisions are completely independent per symbol.
+
+```powershell
+# Default: MU, SNDK, TSLA, NVDA, AMD, QCOM
+.\.venv\Scripts\python.exe run_multi_agent.py
+
+# Custom basket and auto-stop
+.\.venv\Scripts\python.exe run_multi_agent.py --symbols TSLA,NVDA,AMD --duration 1800
+
+# Tighter risk
+.\.venv\Scripts\python.exe run_multi_agent.py `
+    --risk-pct 0.001 --max-risk-usd 100 --max-daily-loss 750
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--symbols` | `MU,SNDK,TSLA,NVDA,AMD,QCOM` | Comma-separated list |
+| `--htf` | `1 hour` | Bias timeframe (applied to all) |
+| `--mtf` | `5 mins` | Entry timeframe (applied to all) |
+| `--risk-pct` | `0.002` | Per-trade risk as fraction of NetLiq (lower than single-symbol — multiple may fire) |
+| `--max-risk-usd` | `150` | Per-trade $ risk cap |
+| `--max-notional-per-symbol` | `25000` | Per-symbol position cap |
+| `--max-total-notional` | `150000` | **Global** notional cap (all symbols) |
+| `--max-daily-loss` | `1500` | **Global** session loss kill switch |
+| `--stop-atr` | `1.5` | Stop multiplier |
+| `--target-atr` | `2.5` | Target multiplier |
+| `--duration` | `0` | Auto-stop after N seconds |
+| `--force-after-hours` | off | Allow outside RTH |
+
+On shutdown the runner force-flattens every open position and prints a per-symbol PnL summary:
+
+```
+Multi-agent session summary
+  MU     opened=2  target=1  stop=1  time=0  regime=0  PnL=$  +12.40
+  SNDK   opened=1  target=0  stop=0  time=1  regime=0  PnL=$   -3.10
+  TSLA   opened=0  target=0  stop=0  time=0  regime=0  PnL=$   +0.00
+  ...
+  TOTAL realized PnL: $+15.30
+```
+
+Files: `run_multi_agent.py` (reuses the same `RegimeAdaptiveAgent` internally).
+
+### Honest expectations for both agents
+
+- **Neither will print money.** Both have negative skew: many small wins, occasional larger losses.
+- **Win rate ~45–55% is normal.** The edge, if any, is in the R:R management.
+- **Overnight gaps bypass intraday stops** — a single Musk tweet can wipe weeks of gains on TSLA.
+- **Paper fills are optimistic** vs live. Backtest fills are optimistic vs paper.
+- **Treat the framework as scaffolding** — backtest on real historical data, walk-forward optimize parameters, monitor in paper for weeks before considering live capital.
+
+---
 
 ## Package layout
 

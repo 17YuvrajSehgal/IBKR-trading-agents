@@ -225,21 +225,31 @@ class RiskManager:
         action:   str,         # "BUY" or "SELL"
         quantity: int,
         price:    float,
+        reserve:  bool = True,
     ) -> RiskCheckResult:
         """
-        Run all risk checks for a proposed order.
+        Run all risk checks for a proposed order, atomically reserving the
+        exposure on approval.
 
-        Checks are evaluated in order of cheapness; the first failure
-        short-circuits the rest (fail-fast).
+        Reservation prevents a race where N parallel callers all read the
+        same pre-fill state and all pass — but together would exceed the cap.
+        With ``reserve=True`` (the default), the n-th caller sees the
+        in-flight reservations from callers 1..n-1.
+
+        If the caller subsequently fails to place the order, it must call
+        :meth:`release_reservation` with the same parameters to undo.
 
         Args:
             symbol:   Ticker symbol
             action:   "BUY" or "SELL"
             quantity: Number of shares
             price:    Proposed order price (limit price)
+            reserve:  When True (default) the approved order's notional and
+                      share count are added to the internal trackers
+                      immediately, so subsequent concurrent checks see them.
 
         Returns:
-            RiskCheckResult with approved=True if all checks pass
+            RiskCheckResult with approved=True if all checks pass.
         """
         # 1. Readonly mode
         if self._limits.readonly:
@@ -334,9 +344,43 @@ class RiskManager:
                 order_notional=order_notional,
             )
 
-        # All checks passed
+        # All checks passed — atomically reserve so concurrent checks see this.
+        if reserve:
+            sign = 1 if action.upper() == "BUY" else -1
+            self._positions[symbol] = current_position + sign * quantity
+            self._notional[symbol] = current_notional + order_notional
+
         self._session_orders_sent += 1
         return RiskCheckResult.ok()
+
+    def release_reservation(
+        self,
+        symbol:   str,
+        action:   str,
+        quantity: int,
+        price:    float,
+    ) -> None:
+        """
+        Undo a reservation made by ``check_order(..., reserve=True)``.
+
+        Call this when the order fails to place at the broker (e.g. exception
+        from placeOrder, or TWS rejection before any partial fill). The
+        reserved exposure is removed so it doesn't permanently inflate the
+        running notional.
+
+        Safe to call repeatedly — clamps at zero.
+        """
+        sign = 1 if action.upper() == "BUY" else -1
+        order_notional = quantity * price
+
+        self._positions[symbol] = self._positions.get(symbol, 0) - sign * quantity
+        new_notional = self._notional.get(symbol, 0.0) - order_notional
+        self._notional[symbol] = max(0.0, new_notional)
+
+        logger.debug(
+            f"Released reservation: {action} {quantity} {symbol} @ ${price:.4f} "
+            f"-> position={self._positions[symbol]} notional=${self._notional[symbol]:,.2f}"
+        )
 
     # ------------------------------------------------------------------
     # Public – state updates (called after fills)
@@ -350,31 +394,15 @@ class RiskManager:
         price:     float,
     ) -> None:
         """
-        Update internal position and notional tracking after a confirmed fill.
+        DEPRECATED. No-op.
 
-        Must be called by the executor for every filled order so that
-        subsequent risk checks reflect reality.
+        Exposure is now reserved atomically inside :meth:`check_order` on
+        approval. Use :meth:`release_reservation` to undo a reservation when
+        order placement fails, and :meth:`record_pnl` to track realized P&L.
 
-        Args:
-            symbol:   Ticker
-            action:   "BUY" or "SELL"
-            quantity: Filled shares
-            price:    Fill price
+        Kept as a no-op for backward compat so existing callers don't break.
         """
-        sign = 1 if action.upper() == "BUY" else -1
-        self._positions[symbol] = self._positions.get(symbol, 0) + sign * quantity
-
-        # Notional tracks absolute open exposure
-        notional_change = quantity * price
-        if sign == 1:
-            self._notional[symbol] = self._notional.get(symbol, 0.0) + notional_change
-        else:
-            self._notional[symbol] = max(0.0, self._notional.get(symbol, 0.0) - notional_change)
-
-        logger.debug(
-            f"Fill recorded: {action} {quantity} {symbol} @ ${price:.4f} | "
-            f"position={self._positions[symbol]} notional=${self._notional[symbol]:,.2f}"
-        )
+        return
 
     def record_pnl(self, realized_pnl: float) -> None:
         """
