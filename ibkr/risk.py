@@ -45,6 +45,7 @@ class RejectionReason(str, Enum):
     INVALID_QUANTITY     = "INVALID_QUANTITY"
     INVALID_PRICE        = "INVALID_PRICE"
     READONLY_MODE        = "READONLY_MODE"
+    SYMBOL_BLACKLISTED   = "SYMBOL_BLACKLISTED"
 
 
 @dataclass
@@ -164,6 +165,12 @@ class RiskLimits:
     max_order_quantity:      int   = 1_000           # shares
     readonly:                bool  = False
 
+    # Per-symbol circuit breakers (set either / both to 0 to disable).
+    # Designed to stop the "keep re-entering DBX and losing $500 each time"
+    # pattern that lost -$3,640 on 2026-05-27.
+    max_consecutive_losses_per_symbol: int   = 2     # consecutive losses before blacklist
+    max_loss_per_symbol_per_session:   float = 500.0 # cumulative $ loss before blacklist
+
 
 # ---------------------------------------------------------------------------
 # Risk manager
@@ -203,6 +210,12 @@ class RiskManager:
         self._session_realized_pnl: float = 0.0
         self._session_orders_sent:  int   = 0
         self._session_orders_rejected: int = 0
+
+        # Per-symbol session PnL and consecutive-loss counters — used by
+        # the circuit breaker that blacklists ticker that keep losing.
+        self._symbol_pnl: dict[str, float] = {}
+        self._symbol_consecutive_losses: dict[str, int] = {}
+        self._symbol_blacklist: dict[str, str] = {}    # symbol -> reason
 
         # Kill switch
         self._halted: bool = False
@@ -263,6 +276,15 @@ class RiskManager:
             return RiskCheckResult.deny(
                 f"Trading halted: {self._halt_reason}",
                 RejectionReason.TRADING_HALTED,
+            )
+
+        # 2b. Per-symbol blacklist (circuit breaker fired earlier)
+        if symbol in self._symbol_blacklist:
+            return RiskCheckResult.deny(
+                f"{symbol} blacklisted for session: {self._symbol_blacklist[symbol]}",
+                RejectionReason.SYMBOL_BLACKLISTED,
+                symbol_pnl=self._symbol_pnl.get(symbol, 0.0),
+                consecutive_losses=self._symbol_consecutive_losses.get(symbol, 0),
             )
 
         # 3. Daily loss limit
@@ -415,6 +437,63 @@ class RiskManager:
         """
         self._session_realized_pnl += realized_pnl
         logger.debug(f"PnL update: {realized_pnl:+.2f} | session_total={self._session_realized_pnl:+.2f}")
+
+    def record_close(self, symbol: str, pnl: float) -> None:
+        """
+        Record a closed trade against the per-symbol circuit-breaker counters
+        and update session P&L.
+
+        Trips the symbol blacklist when either:
+          * cumulative session loss on the symbol crosses
+            ``max_loss_per_symbol_per_session``, or
+          * consecutive-loss count reaches
+            ``max_consecutive_losses_per_symbol``.
+
+        Once blacklisted, subsequent ``check_order`` calls for that symbol
+        return ``SYMBOL_BLACKLISTED`` for the remainder of the session.
+
+        Args:
+            symbol: Ticker that just closed.
+            pnl:    Realized P&L on this close (negative for losses).
+        """
+        self.record_pnl(pnl)
+
+        self._symbol_pnl[symbol] = self._symbol_pnl.get(symbol, 0.0) + pnl
+        if pnl < 0:
+            self._symbol_consecutive_losses[symbol] = (
+                self._symbol_consecutive_losses.get(symbol, 0) + 1
+            )
+        elif pnl > 0:
+            # Profit resets the consecutive-loss counter
+            self._symbol_consecutive_losses[symbol] = 0
+
+        if symbol in self._symbol_blacklist:
+            return  # already tripped
+
+        limits = self._limits
+        sym_pnl = self._symbol_pnl[symbol]
+        sym_losses = self._symbol_consecutive_losses.get(symbol, 0)
+
+        if (
+            limits.max_loss_per_symbol_per_session > 0
+            and sym_pnl <= -abs(limits.max_loss_per_symbol_per_session)
+        ):
+            reason = (
+                f"session loss ${sym_pnl:,.2f} <= "
+                f"-${limits.max_loss_per_symbol_per_session:,.0f} cap"
+            )
+            self._symbol_blacklist[symbol] = reason
+            logger.warning(f"🛑 {symbol} BLACKLISTED — {reason}")
+        elif (
+            limits.max_consecutive_losses_per_symbol > 0
+            and sym_losses >= limits.max_consecutive_losses_per_symbol
+        ):
+            reason = (
+                f"{sym_losses} consecutive losses "
+                f">= {limits.max_consecutive_losses_per_symbol} cap"
+            )
+            self._symbol_blacklist[symbol] = reason
+            logger.warning(f"🛑 {symbol} BLACKLISTED — {reason}")
 
     # ------------------------------------------------------------------
     # Public – manual kill switch

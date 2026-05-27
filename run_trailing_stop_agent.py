@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-daily-loss", type=float, default=20_000.0,
                    help="Session loss cap (the trailing agent only closes, so this is generous)")
     p.add_argument("--max-total-notional", type=float, default=1_000_000.0)
+    # Per-symbol circuit breaker (defaults disabled here — trailing-stop only
+    # closes, so blacklisting on losses is purely informational unless the
+    # trail is opening positions, which it doesn't)
+    p.add_argument("--max-loss-per-symbol", type=float, default=0.0,
+                   help="0=disabled. Trailing-stop only closes, so blacklist tripping is informational.")
+    p.add_argument("--max-consecutive-losses", type=int, default=0)
 
     # Operator
     p.add_argument("--duration", type=float, default=0.0,
@@ -149,6 +155,8 @@ async def main(args: argparse.Namespace) -> int:
         min_order_quantity=1,
         max_order_quantity=1_000_000,
         readonly=False,
+        max_consecutive_losses_per_symbol=args.max_consecutive_losses,
+        max_loss_per_symbol_per_session=args.max_loss_per_symbol,
     ))
 
     cfg = TrailConfig(

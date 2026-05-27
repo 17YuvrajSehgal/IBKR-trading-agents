@@ -521,7 +521,8 @@ class NewsDrivenAgent:
         self.risk.release_reservation(
             symbol, entry_action, position.shares, position.entry_price,
         )
-        self.risk.record_pnl(trade_pnl)
+        # record_close updates session PnL AND the per-symbol circuit breaker
+        self.risk.record_close(symbol, trade_pnl)
 
         logger.info(f"     → trade PnL ≈ ${trade_pnl:+.2f}")
 

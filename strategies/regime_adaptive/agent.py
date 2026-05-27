@@ -557,7 +557,8 @@ class RegimeAdaptiveAgent:
         self.risk.release_reservation(
             self.cfg.symbol, entry_action, pos.shares, pos.entry_price,
         )
-        self.risk.record_pnl(trade_pnl)
+        # record_close updates session PnL AND the per-symbol circuit breaker
+        self.risk.record_close(self.cfg.symbol, trade_pnl)
 
         # Categorize the exit
         if "stop hit" in reason:

@@ -113,6 +113,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-total-notional", type=float, default=750_000.0,
                    help="Global notional cap (across all symbols)")
 
+    # Per-symbol circuit breakers
+    p.add_argument("--max-loss-per-symbol", type=float, default=500.0,
+                   help="Blacklist a symbol after cumulative session loss exceeds this $ amount")
+    p.add_argument("--max-consecutive-losses", type=int, default=2,
+                   help="Blacklist a symbol after N consecutive losing trades")
+
     # Signal tuning
     p.add_argument("--stop-atr", type=float, default=1.5)
     p.add_argument("--target-atr", type=float, default=2.5)
@@ -298,6 +304,8 @@ async def main(args: argparse.Namespace) -> int:
         min_order_quantity=1,
         max_order_quantity=10_000,
         readonly=False,
+        max_consecutive_losses_per_symbol=args.max_consecutive_losses,
+        max_loss_per_symbol_per_session=args.max_loss_per_symbol,
     ))
 
     stop_event = asyncio.Event()

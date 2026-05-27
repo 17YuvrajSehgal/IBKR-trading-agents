@@ -152,6 +152,16 @@ class TrailingStopAgent:
         # Symbols ignored on startup because of manage_only_new=True
         self._ignored_at_startup: set[str] = set()
 
+        # Symbols that have a `_begin_tracking` coroutine in flight.
+        # Added SYNCHRONOUSLY by `_on_position_event` so duplicate position
+        # events for the same symbol (e.g. multiple partial-fill updates
+        # arriving within milliseconds) can't all schedule independent
+        # `_begin_tracking` tasks. Without this, a single market order
+        # whose partial fills produce 8 positionEvent fires would create
+        # 8 phantom tracking entries — exactly what happened on DBX in
+        # the 2026-05-27 session for a -$3,640 cascade.
+        self._tracking_in_flight: set[str] = set()
+
         self._executing = False
 
     # ------------------------------------------------------------------
@@ -188,6 +198,11 @@ class TrailingStopAgent:
                     f"due to manage_only_new=True"
                 )
                 continue
+            # Reserve before await so concurrent positionEvent fires won't
+            # try to track the same symbol independently.
+            if symbol in self._tracking_in_flight or symbol in self.tracked:
+                continue
+            self._tracking_in_flight.add(symbol)
             await self._begin_tracking(ib_pos, source="startup")
 
         # Live updates: new opens, external closes
@@ -218,6 +233,9 @@ class TrailingStopAgent:
         # External close (position went to zero, we were tracking it)
         if position_size == 0 and symbol in self.tracked:
             tp = self.tracked.pop(symbol)
+            # Also drop any in-flight tracking placeholder so a future
+            # re-open can be picked up cleanly.
+            self._tracking_in_flight.discard(symbol)
             if tp.closing:
                 # We initiated this close — already accounted for
                 return
@@ -239,10 +257,17 @@ class TrailingStopAgent:
 
         # New open we should start tracking
         if position_size != 0 and symbol not in self.tracked:
+            # CRITICAL: guard against the partial-fill cascade — many
+            # positionEvent fires arrive in the same millisecond. We must
+            # add to _tracking_in_flight SYNCHRONOUSLY (in this sync
+            # handler, before any await) so later events for the same
+            # symbol see it and skip.
+            if symbol in self._tracking_in_flight:
+                return
             if self.cfg.manage_only_new and symbol in self._ignored_at_startup:
                 # Pre-existing position; still ignored
                 return
-            # Schedule tracking — needs an awaitable for the quote subscribe
+            self._tracking_in_flight.add(symbol)
             asyncio.create_task(self._begin_tracking(ib_pos, source="position_event"))
 
     # ------------------------------------------------------------------
@@ -250,6 +275,15 @@ class TrailingStopAgent:
     # ------------------------------------------------------------------
 
     async def _begin_tracking(self, ib_pos: IBPosition, source: str) -> None:
+        symbol = ib_pos.contract.symbol
+        # The sync side already added us to _tracking_in_flight; clear it
+        # on every exit path so future re-opens can be picked up.
+        try:
+            await self._begin_tracking_inner(ib_pos, source)
+        finally:
+            self._tracking_in_flight.discard(symbol)
+
+    async def _begin_tracking_inner(self, ib_pos: IBPosition, source: str) -> None:
         symbol = ib_pos.contract.symbol
         if symbol in self.tracked:
             return
@@ -487,7 +521,8 @@ class TrailingStopAgent:
         sign = 1 if tp.side == Side.LONG else -1
         trade_pnl = sign * (trigger_price - tp.entry_price) * tp.shares
         self.stats.realized_pnl += trade_pnl
-        self.risk.record_pnl(trade_pnl)
+        # record_close updates session PnL AND the per-symbol circuit breaker
+        self.risk.record_close(tp.symbol, trade_pnl)
 
         logger.info(
             f"[TRAIL] {tp.symbol} trade PnL ≈ ${trade_pnl:+.2f}  "
