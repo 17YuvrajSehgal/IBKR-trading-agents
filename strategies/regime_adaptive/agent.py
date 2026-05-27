@@ -172,10 +172,15 @@ class RegimeAdaptiveAgent:
             return
         # `position` is the signed share count; 0 means flat
         if ib_position.position == 0 and self.position is not None:
+            # Estimate PnL from latest MTF close so the per-symbol circuit
+            # breaker sees external losses (otherwise the trailing-stop
+            # agent could close losers and we'd keep re-entering forever
+            # — exactly what happened with W on 2026-05-27).
+            est_pnl = self._estimate_external_pnl()
             logger.warning(
                 f"[{self.cfg.symbol}] external close detected "
                 f"(was holding {self.position.side.value} {self.position.shares}) "
-                f"— clearing internal state"
+                f"— clearing internal state. est PnL ≈ ${est_pnl:+,.2f}"
             )
             self.recorder.event(
                 "external_close_detected",
@@ -183,6 +188,7 @@ class RegimeAdaptiveAgent:
                 was_side=self.position.side,
                 was_shares=self.position.shares,
                 was_entry=self.position.entry_price,
+                estimated_pnl=est_pnl,
             )
             # Release the reservation so risk numbers stay sane
             entry_action = "BUY" if self.position.side == Action.ENTER_LONG else "SELL"
@@ -190,8 +196,29 @@ class RegimeAdaptiveAgent:
                 self.cfg.symbol, entry_action,
                 self.position.shares, self.position.entry_price,
             )
+            # Feed estimated PnL to the circuit breaker.
+            self.risk.record_close(self.cfg.symbol, est_pnl)
             self.position = None
             self._last_close_at = asyncio.get_event_loop().time()
+
+    def _estimate_external_pnl(self) -> float:
+        """
+        Estimate realized PnL when our position was closed externally
+        (by trailing-stop, flatten utility, or manual TWS). Uses the
+        latest MTF bar close as the exit-price proxy.
+
+        Returns 0.0 if no MTF bar is available yet (shouldn't happen
+        post-warmup but be safe).
+        """
+        if self.position is None or self._last_mtf_close is None:
+            return 0.0
+        exit_price = self._last_mtf_close.close
+        entry = self.position.entry_price
+        shares = self.position.shares
+        if self.position.side == Action.ENTER_LONG:
+            return (exit_price - entry) * shares
+        else:  # ENTER_SHORT
+            return (entry - exit_price) * shares
 
     async def start(self) -> None:
         logger.info(

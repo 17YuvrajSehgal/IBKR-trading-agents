@@ -92,6 +92,15 @@ class TrailConfig:
     # even without a quote update, in case market data goes stale).
     safety_tick_seconds: float = 5.0
 
+    # When True, the trail does NOT arm the INITIAL stop — only kicks in
+    # once a position has moved at least `breakeven_trigger_pct` favorable.
+    # Use this when running alongside a strategy agent that has its own
+    # ATR-based stop: lets the strategy's stop manage initial risk and the
+    # trail only protect profits. Discovered after 2026-05-27: the trail's
+    # tight 0.7% INITIAL stop cut 5 regime-agent trades before the regime's
+    # wider ATR stop could fire, including the W cascade (4 losses).
+    passive_until_profit: bool = False
+
 
 @dataclass
 class TrackedPosition:
@@ -310,8 +319,14 @@ class TrailingStopAgent:
                     break
             await asyncio.sleep(0.1)
 
-        # Initial stop
-        if side == Side.LONG:
+        # Initial stop. In passive-until-profit mode we don't arm a stop
+        # at all in the INITIAL phase — the position's owning strategy
+        # (e.g. the regime agent's ATR stop) handles initial risk, and we
+        # only kick in once the trade reaches BREAKEVEN.
+        if self.cfg.passive_until_profit:
+            # Sentinel: far away from any reachable price, never triggers.
+            stop_price = 0.0 if side == Side.LONG else float("inf")
+        elif side == Side.LONG:
             stop_price = entry * (1 - self.cfg.initial_stop_pct)
         else:
             stop_price = entry * (1 + self.cfg.initial_stop_pct)

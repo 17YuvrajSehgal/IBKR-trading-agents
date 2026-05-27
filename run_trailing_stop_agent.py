@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manage-only-new", action="store_true",
                    help="Skip positions that were already open at startup. "
                         "By default, pre-existing positions are picked up too.")
+    p.add_argument("--passive-until-profit", action="store_true",
+                   help="Do not arm a stop in the INITIAL phase — only "
+                        "manage stops AFTER the position reaches breakeven. "
+                        "Use when running alongside a strategy agent with "
+                        "its own ATR-based stop (e.g. regime-adaptive).")
 
     # Risk-manager passthrough (mostly used for the daily-loss kill switch)
     p.add_argument("--max-daily-loss", type=float, default=20_000.0,
@@ -164,6 +169,7 @@ async def main(args: argparse.Namespace) -> int:
         breakeven_trigger_pct=args.breakeven_trigger_pct,
         trail_pct=args.trail_pct,
         manage_only_new=args.manage_only_new,
+        passive_until_profit=args.passive_until_profit,
     )
 
     stop_event = asyncio.Event()

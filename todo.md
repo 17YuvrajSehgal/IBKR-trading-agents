@@ -23,6 +23,8 @@ These have been smoke-tested on the live paper TWS and confirmed end-to-end:
 - **Cross-client close coordination** — every close path (regime, news, trailing) now does two checks before submitting: (1) a local `closing` flag prevents intra-agent double-fires from queued evaluations; (2) `OrderManager.has_working_order()` uses `reqAllOpenOrdersAsync` to see if any OTHER client in the same account has a working order on the same symbol/side and skips if so. This prevents the regime agent and trailing-stop agent (running in separate processes) from both closing the same position and ending up with an opposite-side short/long over-shoot.
 - **Trail positionEvent race fix** — synchronous `_tracking_in_flight` set added in `TrailingStopAgent._on_position_event` so a cascade of partial-fill positionEvents for the same symbol can't schedule multiple `_begin_tracking` coroutines. Discovered after the 2026-05-27 DBX cascade (-$3,640 from 8 phantom tracking entries).
 - **Per-symbol circuit breaker** — `RiskLimits.max_consecutive_losses_per_symbol` and `max_loss_per_symbol_per_session` blacklist any symbol after N consecutive losses OR cumulative session loss exceeds the threshold. New `RiskManager.record_close(symbol, pnl)` (called by all three agents on every close) updates per-symbol PnL + consecutive-loss counts and trips the blacklist. Blacklisted symbols are denied with `SYMBOL_BLACKLISTED` for the rest of the session. Tested standalone; verified that 2 consecutive losses on a symbol trip the breaker while other symbols still trade normally.
+- **External-close feeds circuit breaker** — when the trailing-stop (or any other client) flattens a tracked position, both the regime agent's and the news agent's `_on_position_event` now estimate realized PnL from the latest bar/quote vs. entry, then call `risk.record_close(symbol, est_pnl)`. Without this, the multi-agent's circuit breaker would never see losses from externally-closed positions and would keep re-entering losers — exactly what happened with W on 2026-05-27 (4 consecutive INITIAL-phase trail closes for -$664.83 with no blacklist trip). Integration-tested: 2 external closes trip the breaker; new orders on the same symbol get rejected as `SYMBOL_BLACKLISTED`.
+- **Passive-until-profit trailing stop** — `TrailConfig.passive_until_profit` (CLI: `--passive-until-profit`) makes the trail leave the INITIAL phase un-armed, only kicking in once the position has moved `breakeven_trigger_pct` favorable. Lets the strategy agent's own ATR-based stop manage initial risk; the trail's job becomes pure profit protection. Discovered after 2026-05-27: the trail's tight 0.7% INITIAL stop cut 5 regime-agent trades (W ×4, TTD ×1) before the regime's wider ATR stop could fire. Unit-tested: passive mode survives -0.7% drops, arms after +0.5% favorable, closes on pullback.
 
 ---
 
@@ -51,7 +53,20 @@ These work in code but haven't been observed under the conditions they're design
 - `flatten_positions.py` now cancels working orders first to prevent recurrence, but the **agent's own `_close_position` doesn't cancel its prior close order** if a re-shutdown happens. Edge case but worth fixing.
 - **Test plan:** simulate by calling stop() twice rapidly or by Ctrl-C'ing during a forced flatten.
 
-### 4. BRK B and XYZ resolution
+### 4. Run with `--passive-until-profit` end-to-end (2026-05-28+)
+
+- Today's pattern was: regime opens W LONG → trail kills at -0.7% → regime re-opens W LONG (with new size) → trail kills again. 4 W rounds for -$664.83. The new flag should stop that cycle (regime stop fires before trail does), but unit-test only — no live session yet.
+- **Test plan:** next paper session, run
+  `run_trailing_stop_agent.py --passive-until-profit`
+  in parallel with `run_multi_agent.py`. Inspect JSONL for INITIAL-phase exits — there should be zero now. Profit-trailing exits should look identical to before.
+
+### 5. External-close PnL estimate accuracy
+
+- The estimate uses the latest bar/quote close, not the actual fill. If the trail fills 0.1-0.3% away from the bar close, our PnL estimate diverges from broker reality. The circuit breaker treats it as ground truth.
+- **Effect:** worst case, breaker trips one trade too early or one trade too late. Not catastrophic, but worth instrumenting.
+- **Better fix later:** subscribe to `ib.execDetailsEvent` (which fires for ALL account fills, including other clients on the same account) and read the actual fill price from the `Execution` object.
+
+### 6. BRK B and XYZ resolution
 
 - We replaced `BRK.B → BRK B` and `SQ → XYZ` in the watchlist but haven't actually run a session that includes them and confirms they qualify.
 - **Test plan:** `flatten_positions.py --dry-run` after `run_multi_agent.py --watchlist watchlist-1.json --category "Payment Processors"` and another with `Banks & Financials`. Watch for error 200 on either.
@@ -120,18 +135,7 @@ Without this, parameter tuning is observation-only.
 
 Already discussed in "Needs real-world validation #1". The hook is in place; the implementation isn't.
 
-### F. JSONL analysis script
-
-Add `analyze_session.py` that takes a JSONL path and prints:
-- Per-symbol win rate, average winner, average loser
-- R:R achieved vs intended
-- Cumulative PnL curve as ASCII
-- Time-of-day distribution of trades
-- Decision-to-fill latency
-
-Useful when you start sharing logs back to me for review.
-
-### G. Configurable news provider weights
+### F. Configurable news provider weights
 
 Provider weights in `classifier.py` are hard-coded. Move them to a JSON config so you can tune without editing code (e.g., bump DJNL to 1.2 after observing it leads BRFG by 30+ seconds).
 

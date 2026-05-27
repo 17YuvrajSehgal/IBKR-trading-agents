@@ -208,7 +208,54 @@ class NewsDrivenAgent:
             await asyncio.sleep(0.25)   # pacing-friendly
 
         self.news.subscribe_headline_updates(self._on_headline)
+
+        # Detect external closes (trailing-stop, flatten utility, manual TWS)
+        # so we don't keep "holding" a position the broker has flattened
+        # and so the per-symbol circuit breaker sees the loss.
+        self.ib.positionEvent += self._on_position_event
+
         logger.info(f"News-driven agent live on {len(self.cfg.symbols)} symbols")
+
+    def _on_position_event(self, ib_position) -> None:
+        """
+        IBKR position-change handler.
+
+        If a symbol we hold drops to position=0 without us closing it,
+        another agent (or manual TWS) closed it. Clear internal state and
+        feed an estimated PnL to the circuit breaker so we don't re-enter
+        on the next headline only to lose again.
+        """
+        sym = ib_position.contract.symbol
+        if sym not in self.positions:
+            return
+        if ib_position.position != 0:
+            return
+        pos = self.positions[sym]
+        # Estimate exit price from latest market-data quote.
+        quote = self.market_data.get_quote(sym)
+        mid = quote.mid() if (quote and quote.is_tradeable()) else None
+        exit_price = float(mid) if mid and mid > 0 else pos.entry_price
+        if pos.side == PositionSide.LONG:
+            est_pnl = (exit_price - pos.entry_price) * pos.shares
+        else:
+            est_pnl = (pos.entry_price - exit_price) * pos.shares
+        logger.warning(
+            f"[{sym}] external close detected "
+            f"(was {pos.side.value} {pos.shares}) — est PnL ≈ ${est_pnl:+,.2f}"
+        )
+        self.recorder.event(
+            "external_close_detected",
+            symbol=sym, was_side=pos.side, was_shares=pos.shares,
+            was_entry=pos.entry_price, estimated_pnl=est_pnl,
+        )
+        entry_action = "BUY" if pos.side == PositionSide.LONG else "SELL"
+        self.risk.release_reservation(sym, entry_action, pos.shares, pos.entry_price)
+        self.risk.record_close(sym, est_pnl)
+        # Cancel the exit monitor task — the position is gone.
+        task = self._exit_monitors.pop(sym, None)
+        if task and not task.done():
+            task.cancel()
+        self.positions.pop(sym, None)
 
     async def stop(self, flatten: bool = True) -> None:
         logger.info("Stopping news-driven agent")
@@ -223,6 +270,10 @@ class NewsDrivenAgent:
                     logger.warning(f"Force-flattening {symbol} on shutdown")
                     await self._close_position(symbol, reason="shutdown")
         finally:
+            try:
+                self.ib.positionEvent -= self._on_position_event
+            except Exception:
+                pass
             try:
                 self.news.unsubscribe_all()
                 self.market_data.unsubscribe_all()
